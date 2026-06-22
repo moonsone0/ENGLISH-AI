@@ -142,7 +142,7 @@
                 <div>
                     <label class="block text-xs font-bold text-slate-500 uppercase mb-1">Hugging Face Access Token</label>
                     <input type="password" id="hfTokenInput" placeholder="hf_..." class="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-600 outline-none text-sm">
-                    <p class="text-[11px] text-slate-400 mt-1">AI 모델 호출을 위해 허깅페이스 토큰이 필요합니다.</p>
+                    <p class="text-[11px] text-slate-400 mt-1">Llama-3 모델 호출을 위해 허깅페이스 토큰이 필요합니다.</p>
                 </div>
             </div>
             <div class="mt-6 flex justify-end gap-2">
@@ -173,4 +173,388 @@
         const sampleSituations = [
             "뉴욕 타임스퀘어 버거가게에서 시그니처 버거 주문하기",
             "런던 지하철역 매표소에서 오이스터 카드 충전 및 길 묻기",
-            "스타
+            "스타벅스에서 텀블러 할인을 받고 샷 추가한 아이스 아메리카노 주문하기",
+            "공항 입국 심사대에서 체류 목적과 기간 답변하기",
+            "호텔 체크인 시 예약 내역 확인 및 고층 방 요구하기"
+        ];
+
+        // 초기화
+        document.addEventListener('DOMContentLoaded', () => {
+            if(!hfToken) openSettings();
+            updateVocabUI();
+            initSTT();
+        });
+
+        // 설정 관리
+        function openSettings() { document.getElementById('settingsModal').classList.remove('hidden'); }
+        function closeSettings() { document.getElementById('settingsModal').classList.add('hidden'); }
+        function saveSettings() {
+            const token = document.getElementById('hfTokenInput').value.trim();
+            if(token) {
+                localStorage.setItem('hf_token', token);
+                hfToken = token;
+                alert('설정이 저장되었습니다.');
+                closeSettings();
+            }
+        }
+
+        // 🎲 랜덤 상황 추천
+        function recommendSituation() {
+            const randomIdx = Math.floor(Math.random() * sampleSituations.length);
+            document.getElementById('situationInput').value = sampleSituations[randomIdx];
+        }
+
+        // 1. 무한 상황극 설정 (상황극 자동 생성 엔진)
+        async function startSituation() {
+            const situation = document.getElementById('situationInput').value.trim();
+            if(!situation) return alert('상황을 입력하거나 추천을 선택해 주세요.');
+            if(!hfToken) return openSettings();
+
+            currentSituationContext = situation;
+            appendSystemMessage(`🤖 '${situation}' 상황극을 준비하고 있습니다...`);
+
+            const prompt = `당신은 영어 회화 교육용 상황극 빌더입니다. 사용자가 제시한 상황 [${situation}]에 맞춰 다음 데이터 구조를 정확히 생성해 주세요. 반드시 다른 마크다운이나 텍스트 없이 순수한 JSON으로만 응답해야 합니다.
+            {
+               "ai_role": "이 상황에서 AI가 맡을 역할과 페르소나 설명",
+               "missions": ["상황 내 완수를 위한 영어 미션 1", "영어 미션 2", "영어 미션 3"],
+               "first_greeting": "상황극을 시작하며 AI 역할로서 사용자에게 건넬 첫 번째 영어 인사말"
+            }`;
+
+            try {
+                const response = await callLLM([{ role: "user", content: prompt }]);
+                const data = JSON.parse(response);
+                
+                currentMissions = data.missions;
+                missionStatus = [false, false, false];
+                
+                // 대시보드 미션 업데이트
+                const mContainer = document.getElementById('missionContainer');
+                mContainer.innerHTML = '';
+                currentMissions.forEach((m, idx) => {
+                    mContainer.innerHTML += `
+                        <div id="mission-${idx}" class="p-2.5 rounded-xl border border-slate-200 text-xs font-medium bg-slate-50 transition-colors flex justify-between items-center">
+                            <span>${idx+1}. ${m}</span>
+                            <span class="status-badge font-bold text-slate-400">[미완료]</span>
+                        </div>
+                    `;
+                });
+
+                // 대화 초기화 및 첫인사 던지기
+                document.getElementById('chatContainer').innerHTML = '';
+                chatHistory = [{ role: "system", content: `You are roleplaying in the situation: ${situation}. Role: ${data.ai_role}. Rule: Keep your responses to 1-3 sentences maximum. Always end with an interactive question to encourage the user to keep speaking.` }];
+                
+                appendMessage('ai', data.first_greeting);
+                speakTTS(data.first_greeting);
+
+            } catch(e) {
+                console.error(e);
+                appendSystemMessage("❌ 상황 로드 중 오류가 발생했습니다. 토큰을 확인하거나 다시 시도해 주세요.");
+            }
+        }
+
+        // 2 & 3 & 5. 대화 처리 및 실시간 피드백 통합 엔진
+        async function sendMessage() {
+            const inputEl = document.getElementById('userInput');
+            const userText = inputEl.value.trim();
+            if(!userText) return;
+
+            appendMessage('user', userText);
+            inputEl.value = '';
+
+            // 한국어 질문 처리 ("~는 영어로 어떻게 해?") 예외 가이드
+            let systemInstruction = "";
+            if(userText.includes("영어로") || userText.includes("어떻게 말해")) {
+                systemInstruction = "주목: 사용자가 한국어로 표현을 묻고 있습니다. 상황극 페르소나를 잠시 유지하면서 부드럽게 영어 교정 표현을 알려주고 '자, 이렇게 말해봐!'라며 대화를 계속 리드하세요.";
+            }
+
+            appendSystemMessage("✍️ AI 선생님이 입력 내용을 분석 중입니다...");
+
+            const payloadMessages = [
+                ...chatHistory,
+                { role: "user", content: userText }
+            ];
+
+            const metaPrompt = `
+            현재 상황극: ${currentSituationContext}
+            현재 미션 리스트: ${JSON.stringify(currentMissions)}
+            사용자의 최신 발화: "${userText}"
+            
+            위 정보를 바탕으로 분석을 수행하고 반드시 아래 규격의 JSON 오브젝트로만 응답하세요. 텍스트 장식이 없어야 파싱이 가능합니다.
+            {
+               "ai_response": "상황극 역할에 맞는 1~3문장 이내의 영어 답변 (반드시 Wh- question 등의 질문으로 마무리하여 다음 대화 유도)",
+               "mission_checked": [현재 대화로 미션1 달성여부 true/false, 미션2 달성여부 true/false, 미션3 달성여부 true/false],
+               "pronunciation_or_grammar_feedback": "사용자가 사용한 문장 중 어색한 문법 교정이나 발음 팁(예: '[✔발음 체크 포인트: 단어명 - 조언]')이 있으면 작성, 없으면 공백"
+            }`;
+
+            payloadMessages.push({ role: "system", content: metaPrompt });
+
+            try {
+                const response = await callLLM(payloadMessages);
+                const cleanJson = response.substring(response.indexOf('{'), response.lastIndexOf('}') + 1);
+                const data = JSON.parse(cleanJson);
+
+                // 시스템 메시지 제거
+                removeLastSystemMessage();
+
+                // 미션 상태 업데이트 처리
+                data.mission_checked.forEach((achieved, idx) => {
+                    if(achieved) updateMissionComplete(idx);
+                });
+
+                // 피드백 처리
+                if(data.pronunciation_or_grammar_feedback.trim()) {
+                    updateFeedback(data.pronunciation_or_grammar_feedback);
+                }
+
+                // AI 메시지 출력
+                appendMessage('ai', data.ai_response);
+                speakTTS(data.ai_response);
+
+                // 대화 이력 누적
+                chatHistory.push({ role: "user", content: userText });
+                chatHistory.push({ role: "assistant", content: data.ai_response });
+
+            } catch (e) {
+                console.error(e);
+                removeLastSystemMessage();
+                appendSystemMessage("❌ 답변을 생성하지 못했습니다. 다시 시도해 주세요.");
+            }
+        }
+
+        // 미션 컴플리트 자바스크립트 함수
+        function updateMissionComplete(idx) {
+            missionStatus[idx] = true;
+            const el = document.getElementById(`mission-${idx}`);
+            if(el) {
+                el.classList.remove('bg-slate-50', 'border-slate-200');
+                el.classList.add('bg-emerald-50', 'border-emerald-300', 'text-emerald-900');
+                el.querySelector('.status-badge').innerHTML = '[완료 ✔]';
+                el.querySelector('.status-badge').classList.replace('text-slate-400', 'text-emerald-600');
+            }
+        }
+
+        // 피드백 보드 가시화
+        function updateFeedback(text) {
+            const container = document.getElementById('feedbackContainer');
+            if(container.innerHTML.includes("표시됩니다")) container.innerHTML = '';
+            container.innerHTML = `
+                <div class="p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 animate-pulse">
+                    <p class="font-semibold text-xs"><i class="fa-solid fa-lightbulb"></i> 코칭 피드백</p>
+                    <p class="text-xs mt-1">${text}</p>
+                </div>
+            ` + container.innerHTML;
+        }
+
+        // 힌트 시스템 (현재 맥락 추천 표현)
+        async function showContextHint() {
+            if(!currentSituationContext) return alert('상황극이 시작된 이후에 이용 가능합니다.');
+            
+            const modal = document.getElementById('hintModal');
+            const list = document.getElementById('hintList');
+            list.innerHTML = "<li>생성 중...</li>";
+            modal.classList.remove('hidden');
+
+            const hintPrompt = [{
+                role: "user",
+                content: `현재 진행중인 상황극 [${currentSituationContext}]의 직전 대화 맥락을 고려하여, 사용자가 답변으로 활용하기 좋은 원어민식 유용한 영어 추천 표현 3가지를 짧은 한글 설명과 함께 배열 형태로 알려줘. JSON 규격 필수: {"hints": ["1. 표현 (설명)", "2. 표현 (설명)", "3. 표현 (설명)"]}`
+            }];
+
+            try {
+                const res = await callLLM(hintPrompt);
+                const data = JSON.parse(res);
+                list.innerHTML = "";
+                data.hints.forEach(h => {
+                    list.innerHTML += `<li class="bg-indigo-50 p-2 rounded-lg font-medium text-indigo-900">${h}</li>`;
+                });
+            } catch(e) {
+                list.innerHTML = "<li>추천 표현을 불러오지 못했습니다.</li>";
+            }
+        }
+        function closeHintModal() { document.getElementById('hintModal').classList.add('hidden'); }
+
+        // STT 기능 구현 (Web Speech API)
+        function initSTT() {
+            window.SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (window.SpeechRecognition) {
+                recognition = new SpeechRecognition();
+                recognition.continuous = false;
+                recognition.lang = 'en-US'; // 기본 영어 설정 (한국어 혼용 시 ko-KR 전환 유연성 필요)
+                
+                recognition.onstart = () => {
+                    isListening = true;
+                    document.getElementById('micBtn').classList.replace('bg-slate-100', 'bg-red-500');
+                    document.getElementById('micBtn').classList.replace('text-slate-600', 'text-white');
+                    document.getElementById('sttStatus').innerText = "🎙️ 듣고 있습니다... (영어로 말씀하세요)";
+                };
+
+                recognition.onend = () => {
+                    isListening = false;
+                    document.getElementById('micBtn').classList.replace('bg-red-500', 'bg-slate-100');
+                    document.getElementById('micBtn').classList.replace('text-white', 'text-slate-600');
+                    document.getElementById('sttStatus').innerText = "";
+                };
+
+                recognition.onresult = (event) => {
+                    const speechToText = event.results[0][0].transcript;
+                    document.getElementById('userInput').value = speechToText;
+                };
+            } else {
+                document.getElementById('sttStatus').innerText = "※ 해당 브라우저는 음성인식을 지원하지 않습니다.";
+            }
+        }
+
+        function toggleSTT() {
+            if(!recognition) return alert("이 브라우저에서는 STT 기능을 사용할 수 없습니다.");
+            if(isListening) {
+                recognition.stop();
+            } else {
+                // 한/영 감지 커스텀 필요시 변경 가능
+                recognition.lang = document.getElementById('situationInput').value ? 'en-US' : 'ko-KR';
+                recognition.start();
+            }
+        }
+
+        // TTS 기능 구현 (SpeechSynthesisUtterance)
+        function speakTTS(text) {
+            if ('speechSynthesis' in window) {
+                window.speechSynthesis.cancel(); // 이전 음성 재생 중단
+                const utterance = new SpeechSynthesisUtterance(text);
+                utterance.lang = 'en-US';
+                
+                // 모바일 기기별 영어 목소리 매칭 최적화
+                const voices = window.speechSynthesis.getVoices();
+                const engVoice = voices.find(v => v.lang.includes('en-US') && v.name.includes('Google'));
+                if(engVoice) utterance.voice = engVoice;
+
+                window.speechSynthesis.speak(utterance);
+            }
+        }
+
+        // 4. 나만의 표현 보관함 (LocalStorage 연동)
+        function saveToVocab(text) {
+            let currentVocab = JSON.parse(localStorage.getItem('vocab_note')) || [];
+            if(!currentVocab.includes(text)) {
+                currentVocab.push(text);
+                localStorage.setItem('vocab_note', JSON.stringify(currentVocab));
+                updateVocabUI();
+                alert('보관함에 저장되었습니다!');
+            }
+        }
+
+        function deleteVocab(text) {
+            let currentVocab = JSON.parse(localStorage.getItem('vocab_note')) || [];
+            currentVocab = currentVocab.filter(item => item !== text);
+            localStorage.setItem('vocab_note', JSON.stringify(currentVocab));
+            updateVocabUI();
+        }
+
+        function updateVocabUI() {
+            const currentVocab = JSON.parse(localStorage.getItem('vocab_note')) || [];
+            document.getElementById('vocabCount').innerText = currentVocab.length;
+            const listEl = document.getElementById('vocabList');
+            listEl.innerHTML = '';
+            
+            if(currentVocab.length === 0) {
+                listEl.innerHTML = `<div class="text-xs text-slate-400 py-4 text-center">저장된 유용한 표현이 없습니다.</div>`;
+                return;
+            }
+
+            currentVocab.forEach(v => {
+                listEl.innerHTML += `
+                    <div class="bg-white p-3 rounded-xl border border-slate-200 shadow-sm flex justify-between items-center gap-2">
+                        <span class="text-sm font-medium text-slate-800">${v}</span>
+                        <div class="flex gap-1 shrink-0">
+                            <button onclick="speakTTS('${v.replace(/'/g, "\\'")}')" class="w-8 h-8 rounded-lg bg-indigo-50 text-indigo-600 text-xs"><i class="fa-solid fa-volume-high"></i></button>
+                            <button onclick="deleteVocab('${v.replace(/'/g, "\\'")}')" class="w-8 h-8 rounded-lg bg-red-50 text-red-500 text-xs"><i class="fa-solid fa-trash"></i></button>
+                        </div>
+                    </div>
+                `;
+            });
+        }
+
+        function toggleVocabDrawer() {
+            const drawer = document.getElementById('vocabDrawer');
+            const icon = document.getElementById('drawerIcon');
+            if(drawer.classList.contains('h-0')) {
+                drawer.classList.replace('h-0', 'h-48');
+                icon.classList.replace('fa-chevron-up', 'fa-chevron-down');
+            } else {
+                drawer.classList.replace('h-48', 'h-0');
+                icon.classList.replace('fa-chevron-down', 'fa-chevron-up');
+            }
+        }
+
+        // 공통 UI 핸들러들
+        function appendMessage(sender, text) {
+            const container = document.getElementById('chatContainer');
+            const isAi = sender === 'ai';
+            
+            const messageHtml = `
+                <div class="flex ${isAi ? 'justify-start' : 'justify-end'} animate-in fade-in duration-150">
+                    <div class="${isAi ? 'bg-indigo-50 border border-indigo-100 text-indigo-950' : 'bg-indigo-600 text-white'} rounded-2xl px-4 py-2.5 max-w-[85%] text-sm shadow-sm relative group">
+                        <p>${text}</p>
+                        ${isAi ? `
+                        <div class="flex gap-2 mt-2 pt-2 border-t border-indigo-100/50 text-[11px] font-medium text-indigo-600">
+                            <button onclick="speakTTS('${text.replace(/'/g, "\\'")}')" class="hover:underline"><i class="fa-solid fa-volume-high mr-1"></i>재생(TTS)</button>
+                            <button onclick="saveToVocab('${text.replace(/'/g, "\\'")}')" class="hover:underline text-amber-600"><i class="fa-solid fa-star mr-1"></i>보관함 추가</button>
+                        </div>` : ''}
+                    </div>
+                </div>
+            `;
+            container.innerHTML += messageHtml;
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function appendSystemMessage(text) {
+            const container = document.getElementById('chatContainer');
+            container.innerHTML += `<div id="sys-loading" class="text-center text-xs text-slate-400 my-2">${text}</div>`;
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function removeLastSystemMessage() {
+            const el = document.getElementById('sys-loading');
+            if(el) el.remove();
+        }
+
+        // 오늘의 학습 기록 다운로드 기능
+        function downloadHistory() {
+            if(chatHistory.length === 0) return alert('다운로드할 대화 내역이 없습니다.');
+            let textContent = `=== 오늘의 LinguaAI 영어 학습 보고서 ===\n\n`;
+            chatHistory.forEach(msg => {
+                const roleName = msg.role === 'user' ? '나(User)' : msg.role === 'assistant' ? 'AI선생님' : '시스템 설정';
+                textContent += `[${roleName}]: ${msg.content}\n\n`;
+            });
+            
+            const blob = new Blob([textContent], { type: 'text/plain;charset=utf-8' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = `English_Study_Log_${new Date().toISOString().slice(0,10)}.txt`;
+            link.click();
+        }
+
+        // Hugging Face Inference API 연동 코어 네트워크 함수
+        async function callLLM(messages) {
+            const response = await fetch("https://api-inference.huggingface.co/v1/chat/completions", {
+                method: "POST",
+                headers: {
+                    "Authorization": `Bearer ${hfToken}`,
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    model: "meta-llama/Meta-Llama-3-8B-Instruct",
+                    messages: messages,
+                    max_tokens: 800,
+                    temperature: 0.7
+                })
+            });
+
+            if(!response.ok) {
+                throw new Error(`API 호출 실패: ${response.statusText}`);
+            }
+
+            const result = await response.json();
+            return result.choices[0].message.content;
+        }
+    </script>
+</body>
+</html>
